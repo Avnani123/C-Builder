@@ -22,20 +22,21 @@
 #include <string.h>
 
 /* ------------------------------------------------------------------ */
-/* Internal state                                                       */
+/* Internal state — exported via uthreads_internal.h for sync.c        */
 /* ------------------------------------------------------------------ */
 
-static uthread_tcb_t threads[UTHREAD_MAX_THREADS];
-static int           thread_count = 0;
-static int           current_tid  = -1;
+uthread_tcb_t threads[UTHREAD_MAX_THREADS];
+int           thread_count = 0;
+int           current_tid  = -1;
 
 /*
  * The scheduler runs in its own context with its own stack.
- * Aligned to 16 bytes to satisfy the x86-64 ABI requirement and other
- * platforms that mandate stack alignment for ucontext / signal frames.
+ * Aligned to 16 bytes to satisfy the x86-64 ABI and other platforms
+ * that mandate natural stack alignment for ucontext / signal frames.
+ * scheduler_stack stays file-local (sync.c does not need it).
  */
-static ucontext_t          scheduler_ctx;
-static alignas(16) char    scheduler_stack[UTHREAD_STACK_SIZE];
+ucontext_t              scheduler_ctx;
+static alignas(16) char scheduler_stack[UTHREAD_STACK_SIZE];
 
 /* ------------------------------------------------------------------ */
 /* Forward declarations                                                 */
@@ -55,6 +56,8 @@ void uthread_init(void) {
     threads[0].id      = 0;
     threads[0].state   = UTHREAD_RUNNING;
     threads[0].joining = -1;
+    threads[0].joined  = 0;
+    atomic_init(&threads[0].baton, 0);
     threads[0].stack   = NULL; /* main uses the OS-provided stack */
     getcontext(&threads[0].ctx);
 
@@ -89,10 +92,9 @@ static int find_next_runnable(void) {
 }
 
 /*
- * all_finished() — Return 1 if every non-main thread has finished
- * (main itself may be RUNNING or BLOCKED waiting for them).
+ * all_workers_finished() — Return 1 if every non-main thread is FINISHED.
  */
-static int all_finished(void) {
+static int all_workers_finished(void) {
     for (int i = 1; i < thread_count; i++) {
         if (threads[i].state != UTHREAD_FINISHED) {
             return 0;
@@ -104,15 +106,14 @@ static int all_finished(void) {
 /*
  * scheduler() — Central dispatch loop.
  *
- * Entered via swapcontext() from yield / join / exit.
+ * Entered via swapcontext() from yield / join / mutex / semaphore / exit.
  * Picks the next RUNNABLE thread and switches into it.
  *
  * If no thread is runnable:
- *   - If all non-main threads are FINISHED, wake thread 0 (main) so it
- *     can return from its outstanding uthread_join() calls and exit.
- *   - Otherwise there is a true deadlock (all remaining threads are
- *     permanently BLOCKED on one another with no way to proceed).
- *     Report it and abort.
+ *   • All workers finished → wake thread 0 (main) so it can drain its
+ *     uthread_join() calls and exit cleanly.
+ *   • Otherwise → true deadlock (every live thread is BLOCKED on something
+ *     that can never be resolved). Report the state and abort.
  */
 static void scheduler(void) {
     while (1) {
@@ -122,43 +123,30 @@ static void scheduler(void) {
             current_tid         = next;
             threads[next].state = UTHREAD_RUNNING;
             swapcontext(&scheduler_ctx, &threads[next].ctx);
-            /*
-             * Execution resumes here after the thread yields, exits, or
-             * blocks again.  Loop to pick the next runnable thread.
-             */
+            /* Resume here after the thread yields, exits, or blocks. */
             continue;
         }
 
-        /*
-         * No RUNNABLE thread found.
-         *
-         * Case 1: all worker threads are done — wake main so it can
-         *         process any remaining uthread_join() calls and exit.
-         */
-        if (all_finished()) {
+        /* Case 1: all worker threads done — wake main. */
+        if (all_workers_finished()) {
             if (threads[0].state == UTHREAD_BLOCKED ||
                 threads[0].state == UTHREAD_RUNNABLE) {
                 threads[0].state = UTHREAD_RUNNABLE;
                 continue;
             }
-            /* Main has also finished — we are fully done. */
-            break;
+            break; /* main also finished — done */
         }
 
-        /*
-         * Case 2: some threads still exist but none is runnable.
-         * This is a deadlock — every live thread is BLOCKED waiting
-         * on something that will never happen.
-         */
+        /* Case 2: deadlock — no thread can ever become runnable. */
+        static const char * const state_names[] = {
+            "RUNNABLE", "RUNNING", "BLOCKED", "FINISHED"
+        };
         fprintf(stderr,
-                "uthreads: deadlock detected — no runnable thread exists.\n"
-                "          Remaining thread states:\n");
+                "uthreads: deadlock — no runnable thread.\n"
+                "          Thread states:\n");
         for (int i = 0; i < thread_count; i++) {
-            static const char * const names[] = {
-                "RUNNABLE", "RUNNING", "BLOCKED", "FINISHED"
-            };
-            fprintf(stderr, "          tid %d → %s\n",
-                    i, names[(int)threads[i].state]);
+            fprintf(stderr, "            tid %d → %s\n",
+                    i, state_names[(int)threads[i].state]);
         }
         abort();
     }
@@ -169,15 +157,14 @@ static void scheduler(void) {
 /* ------------------------------------------------------------------ */
 
 /*
- * thread_wrapper() — Entered when a newly created thread starts.
- * Calls the user function and then calls uthread_exit() so the thread
- * is properly cleaned up even if the user forgets to call it.
+ * thread_wrapper() — Entered when a newly created thread first runs.
+ * Calls the user function then calls uthread_exit() so the thread is
+ * properly cleaned up even if the user function returns without calling it.
  */
 static void thread_wrapper(void) {
     uthread_tcb_t *self   = &threads[current_tid];
     void          *retval = self->func(self->arg);
     uthread_exit(retval);
-    /* unreachable */
     __builtin_unreachable();
 }
 
@@ -195,12 +182,12 @@ int uthread_create(uthread_t *tid, void *(*func)(void *), void *arg) {
     t->id      = new_tid;
     t->state   = UTHREAD_RUNNABLE;
     t->joining = -1;
+    t->joined  = 0;
+    atomic_init(&t->baton, 0);
     t->func    = func;
     t->arg     = arg;
     t->retval  = NULL;
-    t->joined  = 0;
 
-    /* Allocate a private stack for this thread. */
     t->stack = malloc(UTHREAD_STACK_SIZE);
     if (!t->stack) {
         thread_count--;
@@ -239,20 +226,19 @@ void uthread_exit(void *retval) {
     self->retval = retval;
     self->state  = UTHREAD_FINISHED;
 
-    /* Wake any thread that is blocked on uthread_join(self->id). */
+    /* Wake any thread blocked on uthread_join(self->id). */
     if (self->joining != -1) {
         threads[self->joining].state = UTHREAD_RUNNABLE;
         self->joining = -1;
     }
 
     /*
-     * Jump to the scheduler.  We intentionally do NOT free self->stack
-     * here because we are still running on it.  The caller
-     * (uthread_join) frees it after the thread is confirmed FINISHED.
+     * Jump to the scheduler.  We cannot free self->stack here because
+     * we are still executing on it.  uthread_join() frees it once the
+     * thread is confirmed FINISHED.
      */
     swapcontext(&self->ctx, &scheduler_ctx);
 
-    /* The scheduler must never resume a FINISHED thread. */
     assert(0 && "uthread_exit: scheduler resumed a finished thread");
     __builtin_unreachable();
 }
@@ -262,56 +248,32 @@ void uthread_exit(void *retval) {
 /* ------------------------------------------------------------------ */
 
 int uthread_join(uthread_t tid, void **retval) {
-    /* Reject invalid tid. */
-    if (tid < 0 || tid >= thread_count) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    /* Reject self-join (would deadlock immediately). */
-    if (tid == current_tid) {
-        errno = EDEADLK;
-        return -1;
-    }
+    if (tid < 0 || tid >= thread_count) { errno = EINVAL;   return -1; }
+    if (tid == current_tid)             { errno = EDEADLK;  return -1; }
 
     uthread_tcb_t *target = &threads[tid];
 
-    /* Reject double-join: once a thread has been joined, its resources
-     * are freed; a second join would access freed memory.             */
-    if (target->joined) {
+    /* Reject double-join and concurrent-join. */
+    if (target->joined ||
+        (target->joining != -1 && target->joining != current_tid)) {
         errno = EINVAL;
         return -1;
     }
 
-    /*
-     * Reject concurrent join: if another thread is already waiting on
-     * the target, adding a second waiter would require a wait-list,
-     * which this implementation does not support.
-     */
-    if (target->joining != -1 && target->joining != current_tid) {
-        errno = EINVAL;
-        return -1;
-    }
-
-    /*
-     * Block self and yield to the scheduler until the target finishes.
-     * target->uthread_exit() will flip us back to RUNNABLE.
-     */
+    /* Block until the target finishes; its exit() wakes us. */
     while (target->state != UTHREAD_FINISHED) {
         target->joining            = current_tid;
         threads[current_tid].state = UTHREAD_BLOCKED;
         swapcontext(&threads[current_tid].ctx, &scheduler_ctx);
-        /* Resume here once we've been made RUNNABLE again. */
     }
 
-    /* Mark as joined before reading the return value. */
     target->joined = 1;
 
     if (retval) {
         *retval = target->retval;
     }
 
-    /* Free the joined thread's stack (safe now — it's finished). */
+    /* Safe to free now — target is no longer running on its stack. */
     if (target->stack) {
         free(target->stack);
         target->stack = NULL;
