@@ -49,6 +49,8 @@ uthreads/
 │   └── sync_demo.c      # Synchronization tests (counter, critical section, producer-consumer)
 ├── Makefile             # Build automation suite
 └── README.md            # Project documentation
+```
+
 ## 🚀 Getting Started
 
 ### Prerequisites
